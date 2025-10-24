@@ -105,6 +105,9 @@ pub struct LayoutEngine {
 impl LayoutEngine {
     pub fn set_layout_settings(&mut self, settings: &LayoutSettings) {
         self.layout_settings = settings.clone();
+        if let LayoutSystemKind::Scroll(system) = &mut self.tree {
+            system.update_settings(&settings.scroll);
+        }
     }
 
     fn active_floating_windows_flat(&self, space: SpaceId) -> Vec<WindowId> {
@@ -338,9 +341,9 @@ impl LayoutEngine {
             crate::common::config::LayoutMode::Bsp => {
                 LayoutSystemKind::Bsp(crate::layout_engine::BspLayoutSystem::default())
             }
-            crate::common::config::LayoutMode::Scroll => {
-                LayoutSystemKind::Scroll(crate::layout_engine::ScrollLayoutSystem::default())
-            }
+            crate::common::config::LayoutMode::Scroll => LayoutSystemKind::Scroll(
+                crate::layout_engine::ScrollLayoutSystem::from_settings(&layout_settings.scroll),
+            ),
         };
 
         LayoutEngine {
@@ -841,6 +844,7 @@ impl LayoutEngine {
                 match &mut self.tree {
                     LayoutSystemKind::Traditional(s) => s.toggle_tile_orientation(layout),
                     LayoutSystemKind::Bsp(s) => s.toggle_tile_orientation(layout),
+                    LayoutSystemKind::Scroll(s) => s.toggle_tile_orientation(layout),
                 }
 
                 EventResponse::default()

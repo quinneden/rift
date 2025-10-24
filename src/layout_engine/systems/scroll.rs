@@ -2,11 +2,32 @@ use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use serde::{Deserialize, Serialize};
 
 use crate::actor::app::{WindowId, pid_t};
+use crate::common::config::ScrollLayoutSettings;
 use crate::layout_engine::systems::LayoutSystem;
 use crate::layout_engine::{Direction, LayoutId, LayoutKind};
 
 const MIN_WINDOW_DIMENSION: f64 = 32.0;
 const MIN_WIDTH_UNITS: f64 = 0.2;
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollDirection {
+    #[serde(rename = "forward")]
+    Forward,
+    #[serde(rename = "reverse")]
+    Reverse,
+}
+
+impl ScrollDirection {
+    fn toggle(self) -> Self {
+        match self {
+            ScrollDirection::Forward => ScrollDirection::Reverse,
+            ScrollDirection::Reverse => ScrollDirection::Forward,
+        }
+    }
+
+    #[inline]
+    fn is_reverse(self) -> bool { matches!(self, ScrollDirection::Reverse) }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct ScrollLayoutState {
@@ -14,6 +35,7 @@ struct ScrollLayoutState {
     selected: Option<WindowId>,
     widths: Vec<f64>,
     scroll_offset: f64,
+    direction: ScrollDirection,
 }
 
 impl Default for ScrollLayoutState {
@@ -23,6 +45,7 @@ impl Default for ScrollLayoutState {
             selected: None,
             scroll_offset: 0.0,
             widths: Vec::new(),
+            direction: ScrollDirection::Forward,
         }
     }
 }
@@ -53,8 +76,8 @@ impl ScrollLayoutState {
         self.windows.iter().position(|w| *w == selected)
     }
 
-    fn ensure_selection(&mut self) {
-        self.ensure_widths();
+    fn ensure_selection(&mut self, default_ratio: f64) {
+        self.ensure_widths(default_ratio);
         if self.windows.is_empty() {
             self.selected = None;
             self.scroll_offset = 0.0;
@@ -70,7 +93,7 @@ impl ScrollLayoutState {
         self.scroll_offset = self.scroll_offset.clamp(0.0, self.max_offset());
     }
 
-    fn remove_window(&mut self, wid: WindowId) -> bool {
+    fn remove_window(&mut self, wid: WindowId, default_ratio: f64) -> bool {
         if let Some(idx) = self.windows.iter().position(|w| *w == wid) {
             self.windows.remove(idx);
             if idx < self.widths.len() {
@@ -90,37 +113,85 @@ impl ScrollLayoutState {
             } else if let Some(sel_idx) = self.selected_index() {
                 self.scroll_offset = sel_idx as f64;
             }
-            self.ensure_widths();
+            self.ensure_widths(default_ratio);
             true
         } else {
             false
         }
     }
 
-    fn ensure_widths(&mut self) {
+    fn ensure_widths(&mut self, default_ratio: f64) {
+        let fallback = default_ratio.max(MIN_WIDTH_UNITS);
         if self.widths.len() != self.windows.len() {
-            self.widths.resize(self.windows.len(), 1.0);
+            self.widths.resize(self.windows.len(), fallback);
         }
         for width in &mut self.widths {
-            if *width < MIN_WIDTH_UNITS {
-                *width = MIN_WIDTH_UNITS;
+            if !width.is_finite() || *width < MIN_WIDTH_UNITS {
+                *width = fallback;
             }
         }
         if self.widths.iter().all(|w| *w <= 0.0) {
             for w in &mut self.widths {
-                *w = 1.0;
+                *w = fallback;
             }
         }
     }
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Clone, Debug)]
+struct ScrollRuntimeConfig {
+    default_window_ratio: f64,
+    center_bias: f64,
+    snap_threshold: f64,
+}
+
+impl ScrollRuntimeConfig {
+    fn from_settings(settings: &ScrollLayoutSettings) -> Self {
+        let default_ratio = settings.window_fraction.max(MIN_WIDTH_UNITS);
+        let center_bias = settings.center_bias.clamp(-0.49, 0.49);
+        let snap_threshold = settings.snap_threshold.clamp(0.05, 0.95);
+        Self {
+            default_window_ratio: default_ratio,
+            center_bias,
+            snap_threshold,
+        }
+    }
+
+    fn center_factor(&self) -> f64 { (0.5 + self.center_bias).clamp(0.0, 1.0) }
+
+    fn for_serde() -> Self { Self::from_settings(&ScrollLayoutSettings::default()) }
+}
+
+impl Default for ScrollRuntimeConfig {
+    fn default() -> Self { Self::from_settings(&ScrollLayoutSettings::default()) }
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct ScrollLayoutSystem {
     layouts: slotmap::SlotMap<LayoutId, ScrollLayoutState>,
+    #[serde(skip)]
+    #[serde(default = "ScrollRuntimeConfig::for_serde")]
+    settings: ScrollRuntimeConfig,
 }
 
 impl ScrollLayoutSystem {
+    pub fn from_settings(settings: &ScrollLayoutSettings) -> Self {
+        Self {
+            layouts: slotmap::SlotMap::default(),
+            settings: ScrollRuntimeConfig::from_settings(settings),
+        }
+    }
+
+    pub fn update_settings(&mut self, settings: &ScrollLayoutSettings) {
+        self.settings = ScrollRuntimeConfig::from_settings(settings);
+        for state in self.layouts.values_mut() {
+            state.ensure_widths(self.settings.default_window_ratio);
+        }
+    }
+
     pub fn scroll_by(&mut self, layout: LayoutId, delta: f64) -> Option<WindowId> {
+        let default_ratio = self.settings.default_window_ratio;
+        let snap_threshold = self.settings.snap_threshold;
         let state = self.layouts.get_mut(layout)?;
         if state.windows.is_empty() {
             state.selected = None;
@@ -128,17 +199,23 @@ impl ScrollLayoutSystem {
             return None;
         }
 
-        state.ensure_selection();
+        state.ensure_selection(default_ratio);
 
         let prev_index = state.selected_index().unwrap_or(0);
 
         state.scroll_offset = (state.scroll_offset + delta).clamp(0.0, state.max_offset());
 
-        let target_idx = state.scroll_offset.round().clamp(0.0, state.max_offset()) as usize;
+        let base = state.scroll_offset.floor().clamp(0.0, state.max_offset());
+        let frac = state.scroll_offset - base;
+        let mut target_idx = base as usize;
+        if frac >= snap_threshold && target_idx + 1 < state.windows.len() {
+            target_idx += 1;
+        }
 
         if target_idx != prev_index {
             let wid = state.windows[target_idx];
             state.selected = Some(wid);
+            state.scroll_offset = target_idx as f64;
             Some(wid)
         } else {
             None
@@ -146,10 +223,25 @@ impl ScrollLayoutSystem {
     }
 
     pub fn finalize_scroll(&mut self, layout: LayoutId) -> Option<WindowId> {
+        let default_ratio = self.settings.default_window_ratio;
+        let snap_threshold = self.settings.snap_threshold;
         let state = self.layouts.get_mut(layout)?;
-        state.ensure_selection();
+        state.ensure_selection(default_ratio);
         state.scroll_offset = state.scroll_offset.clamp(0.0, state.max_offset());
-        None
+
+        let base = state.scroll_offset.floor().clamp(0.0, state.max_offset());
+        let frac = state.scroll_offset - base;
+        let mut target_idx = base as usize;
+        if frac >= snap_threshold && target_idx + 1 < state.windows.len() {
+            target_idx += 1;
+        }
+        if let Some(&wid) = state.windows.get(target_idx) {
+            state.scroll_offset = target_idx as f64;
+            state.selected = Some(wid);
+            Some(wid)
+        } else {
+            None
+        }
     }
 
     fn layout_state(&mut self, layout: LayoutId) -> Option<&mut ScrollLayoutState> {
@@ -159,6 +251,10 @@ impl ScrollLayoutSystem {
     fn layout_state_ref(&self, layout: LayoutId) -> Option<&ScrollLayoutState> {
         self.layouts.get(layout)
     }
+}
+
+impl Default for ScrollLayoutSystem {
+    fn default() -> Self { Self::from_settings(&ScrollLayoutSettings::default()) }
 }
 
 impl LayoutSystem for ScrollLayoutSystem {
@@ -215,30 +311,25 @@ impl LayoutSystem for ScrollLayoutSystem {
             (screen.size.width - outer.left - outer.right).max(MIN_WINDOW_DIMENSION);
         let available_height =
             (screen.size.height - outer.top - outer.bottom).max(MIN_WINDOW_DIMENSION);
-        let available_content_width =
-            (available_width - gap * (len.saturating_sub(1) as f64)).max(MIN_WINDOW_DIMENSION);
-
-        let mut weights: Vec<f64> =
-            state.widths.iter().take(len).map(|w| w.max(MIN_WIDTH_UNITS)).collect();
-        if weights.len() < len {
-            weights.resize(len, 1.0);
-        }
-        let total_units = weights.iter().sum::<f64>().max(MIN_WIDTH_UNITS * len as f64);
-        let unit_scale = if total_units <= f64::EPSILON {
-            available_content_width / len as f64
-        } else {
-            available_content_width / total_units
-        };
-
         let mut pixel_widths = Vec::with_capacity(len);
-        for w in &weights {
-            pixel_widths.push(w * unit_scale);
+        let width_scale = available_width.max(MIN_WINDOW_DIMENSION);
+        let default_width =
+            (self.settings.default_window_ratio * width_scale).max(MIN_WINDOW_DIMENSION);
+        for w in state.widths.iter().take(len) {
+            let ratio = w.max(MIN_WIDTH_UNITS);
+            pixel_widths.push((ratio * width_scale).max(MIN_WINDOW_DIMENSION));
+        }
+        if pixel_widths.len() < len {
+            let missing = len - pixel_widths.len();
+            pixel_widths.extend(std::iter::repeat(default_width).take(missing));
         }
 
-        let mut prefix = Vec::with_capacity(len);
+        let mut left_offsets = Vec::with_capacity(len);
+        let mut centers = Vec::with_capacity(len);
         let mut acc = 0.0;
         for width in &pixel_widths {
-            prefix.push(acc);
+            left_offsets.push(acc);
+            centers.push(acc + width / 2.0);
             acc += *width + gap;
         }
 
@@ -248,26 +339,47 @@ impl LayoutSystem for ScrollLayoutSystem {
             screen.origin.y + outer.top + (available_height - window_height).max(0.0) / 2.0;
 
         let offset = state.scroll_offset.clamp(0.0, state.max_offset());
-        let idx_floor = offset.floor() as usize;
-        let frac = offset - idx_floor as f64;
-        let mut shift = 0.0;
-        for i in 0..idx_floor.min(len) {
-            shift += pixel_widths[i] + gap;
-        }
-        if idx_floor < len {
-            shift += frac * (pixel_widths[idx_floor] + gap);
-        }
+        let (focus_index, frac) = if len <= 1 {
+            (0usize, 0.0f64)
+        } else {
+            let max_index = len - 1;
+            let clamped = offset.clamp(0.0, max_index as f64);
+            let idx_floor = clamped.floor() as usize;
+            let frac = (clamped - idx_floor as f64).clamp(0.0, 1.0);
+            (idx_floor.min(max_index), frac)
+        };
+
+        let focus_center_rel = if frac > f64::EPSILON && focus_index + 1 < len {
+            let current = centers[focus_index];
+            let next = centers[focus_index + 1];
+            current * (1.0 - frac) + next * frac
+        } else {
+            centers[focus_index]
+        };
+
+        let viewport_center = base_x + available_width * self.settings.center_factor();
+        let center_adjust = viewport_center - (base_x + focus_center_rel);
 
         state
             .windows
             .iter()
             .enumerate()
             .map(|(idx, wid)| {
-                let x = base_x + prefix[idx] - shift;
-                let frame = CGRect::new(
-                    CGPoint::new(x, base_y),
-                    CGSize::new(pixel_widths[idx], window_height),
-                );
+                let x_base = base_x + left_offsets[idx] + center_adjust;
+                let frame = if state.direction.is_reverse() {
+                    let mirrored_x =
+                        base_x + available_width - (x_base - base_x) - pixel_widths[idx];
+                    CGRect::new(
+                        CGPoint::new(mirrored_x, base_y),
+                        CGSize::new(pixel_widths[idx], window_height),
+                    )
+                } else {
+                    CGRect::new(
+                        CGPoint::new(x_base, base_y),
+                        CGSize::new(pixel_widths[idx], window_height),
+                    )
+                };
+
                 (*wid, frame)
             })
             .collect()
@@ -296,6 +408,7 @@ impl LayoutSystem for ScrollLayoutSystem {
         layout: LayoutId,
         direction: Direction,
     ) -> (Option<WindowId>, Vec<WindowId>) {
+        let default_ratio = self.settings.default_window_ratio;
         let state = match self.layout_state(layout) {
             Some(state) => state,
             None => return (None, Vec::new()),
@@ -307,7 +420,7 @@ impl LayoutSystem for ScrollLayoutSystem {
             return (None, Vec::new());
         }
 
-        state.ensure_selection();
+        state.ensure_selection(default_ratio);
         let current = state.selected_index().unwrap_or(0);
 
         let target = match direction {
@@ -326,25 +439,33 @@ impl LayoutSystem for ScrollLayoutSystem {
     }
 
     fn add_window_after_selection(&mut self, layout: LayoutId, wid: WindowId) {
+        let default_ratio = self.settings.default_window_ratio;
         let Some(state) = self.layout_state(layout) else { return };
 
         let insert_idx = state.selected_index().map(|idx| idx + 1).unwrap_or(state.windows.len());
         state.windows.insert(insert_idx, wid);
-        state.widths.insert(insert_idx, 1.0);
+        state.widths.insert(insert_idx, default_ratio);
         state.selected = Some(wid);
-        state.scroll_offset = state.scroll_offset.clamp(0.0, state.max_offset());
-        state.ensure_widths();
+        state.scroll_offset = (insert_idx as f64).min(state.max_offset());
+        state.ensure_widths(default_ratio);
     }
 
     fn remove_window(&mut self, wid: WindowId) {
+        let default_ratio = self.settings.default_window_ratio;
         for state in self.layouts.values_mut() {
-            if state.remove_window(wid) {
-                state.ensure_selection();
+            if state.remove_window(wid, default_ratio) {
+                state.ensure_selection(default_ratio);
+                if let Some(idx) = state.selected_index() {
+                    state.scroll_offset = idx as f64;
+                } else {
+                    state.scroll_offset = 0.0;
+                }
             }
         }
     }
 
     fn remove_windows_for_app(&mut self, pid: pid_t) {
+        let default_ratio = self.settings.default_window_ratio;
         for state in self.layouts.values_mut() {
             let mut removed_selected = false;
             let mut idx = 0;
@@ -361,16 +482,22 @@ impl LayoutSystem for ScrollLayoutSystem {
                     idx += 1;
                 }
             }
-            state.ensure_widths();
+            state.ensure_widths(default_ratio);
             if removed_selected {
-                state.ensure_selection();
+                state.ensure_selection(default_ratio);
             } else {
                 state.clamp_offset();
+            }
+            if let Some(sel_idx) = state.selected_index() {
+                state.scroll_offset = sel_idx as f64;
+            } else if state.windows.is_empty() {
+                state.scroll_offset = 0.0;
             }
         }
     }
 
     fn set_windows_for_app(&mut self, layout: LayoutId, pid: pid_t, desired: Vec<WindowId>) {
+        let default_ratio = self.settings.default_window_ratio;
         let Some(state) = self.layout_state(layout) else { return };
 
         let mut first_index = None;
@@ -395,11 +522,16 @@ impl LayoutSystem for ScrollLayoutSystem {
         }
 
         if desired.is_empty() {
-            state.ensure_widths();
+            state.ensure_widths(default_ratio);
             if removed_selected {
-                state.ensure_selection();
+                state.ensure_selection(default_ratio);
             } else {
                 state.clamp_offset();
+            }
+            if let Some(idx) = state.selected_index() {
+                state.scroll_offset = idx as f64;
+            } else {
+                state.scroll_offset = 0.0;
             }
             return;
         }
@@ -407,7 +539,7 @@ impl LayoutSystem for ScrollLayoutSystem {
         let insert_idx = first_index.unwrap_or(state.windows.len());
         for (offset, wid) in desired.iter().enumerate() {
             state.windows.insert(insert_idx + offset, *wid);
-            state.widths.insert(insert_idx + offset, 1.0);
+            state.widths.insert(insert_idx + offset, default_ratio);
         }
 
         if removed_selected {
@@ -415,7 +547,12 @@ impl LayoutSystem for ScrollLayoutSystem {
             state.scroll_offset = (insert_idx as f64).min(state.max_offset());
         }
 
-        state.ensure_selection();
+        state.ensure_selection(default_ratio);
+        if let Some(idx) = state.selected_index() {
+            state.scroll_offset = idx as f64;
+        } else {
+            state.scroll_offset = 0.0;
+        }
     }
 
     fn has_windows_for_app(&self, layout: LayoutId, pid: pid_t) -> bool {
@@ -439,18 +576,52 @@ impl LayoutSystem for ScrollLayoutSystem {
         }
 
         state.selected = Some(wid);
-        state.scroll_offset = state.scroll_offset.clamp(0.0, state.max_offset());
+        if let Some(idx) = state.selected_index() {
+            state.scroll_offset = idx as f64;
+        } else {
+            state.scroll_offset = state.scroll_offset.clamp(0.0, state.max_offset());
+        }
         true
     }
 
     fn on_window_resized(
         &mut self,
-        _layout: LayoutId,
-        _wid: WindowId,
-        _old_frame: CGRect,
-        _new_frame: CGRect,
-        _screen: CGRect,
+        layout: LayoutId,
+        wid: WindowId,
+        old_frame: CGRect,
+        new_frame: CGRect,
+        screen: CGRect,
+        gaps: &crate::common::config::GapSettings,
     ) {
+        let _ = (screen, gaps);
+        let default_ratio = self.settings.default_window_ratio;
+        let Some(state) = self.layout_state(layout) else { return };
+        let Some(idx) = state.windows.iter().position(|w| *w == wid) else {
+            return;
+        };
+        if idx >= state.widths.len() {
+            return;
+        }
+
+        state.ensure_widths(default_ratio);
+
+        let old_span = old_frame.size.width.max(f64::EPSILON);
+        let new_span = new_frame.size.width.max(MIN_WINDOW_DIMENSION);
+
+        if old_span <= f64::EPSILON {
+            return;
+        }
+
+        let ratio = (new_span / old_span).clamp(0.05, 20.0);
+        state.widths[idx] = (state.widths[idx] * ratio).max(MIN_WIDTH_UNITS);
+        state.ensure_widths(default_ratio);
+
+        if let Some(sel_idx) = state.selected_index() {
+            state.scroll_offset = state.scroll_offset.clamp(0.0, state.max_offset());
+            if sel_idx == idx {
+                state.scroll_offset = sel_idx as f64;
+            }
+        }
     }
 
     fn swap_windows(&mut self, layout: LayoutId, a: WindowId, b: WindowId) -> bool {
@@ -476,10 +647,11 @@ impl LayoutSystem for ScrollLayoutSystem {
     }
 
     fn move_selection(&mut self, layout: LayoutId, direction: Direction) -> bool {
+        let default_ratio = self.settings.default_window_ratio;
         let Some(state) = self.layout_state(layout) else {
             return false;
         };
-        state.ensure_selection();
+        state.ensure_selection(default_ratio);
         let Some(idx) = state.selected_index() else {
             return false;
         };
@@ -516,17 +688,18 @@ impl LayoutSystem for ScrollLayoutSystem {
         from_layout: LayoutId,
         to_layout: LayoutId,
     ) {
+        let default_ratio = self.settings.default_window_ratio;
         let wid_opt = {
             let Some(from_state) = self.layout_state(from_layout) else {
                 return;
             };
-            from_state.ensure_selection();
+            from_state.ensure_selection(default_ratio);
             let Some(idx) = from_state.selected_index() else { return };
             let wid = from_state.windows.remove(idx);
             let width = if idx < from_state.widths.len() {
                 from_state.widths.remove(idx)
             } else {
-                1.0
+                default_ratio
             };
             if from_state.windows.is_empty() {
                 from_state.selected = None;
@@ -536,7 +709,7 @@ impl LayoutSystem for ScrollLayoutSystem {
                 from_state.selected = Some(from_state.windows[new_idx]);
                 from_state.scroll_offset = new_idx as f64;
             }
-            from_state.ensure_widths();
+            from_state.ensure_widths(default_ratio);
             Some((wid, width))
         };
 
@@ -549,19 +722,41 @@ impl LayoutSystem for ScrollLayoutSystem {
             to_state.windows.insert(insert_idx, wid);
             to_state.widths.insert(insert_idx, width.max(MIN_WIDTH_UNITS));
             to_state.selected = Some(wid);
-            to_state.scroll_offset = to_state.scroll_offset.clamp(0.0, to_state.max_offset());
-            to_state.ensure_widths();
+            to_state.ensure_widths(default_ratio);
+            if let Some(idx) = to_state.selected_index() {
+                to_state.scroll_offset = idx as f64;
+            } else {
+                to_state.scroll_offset = 0.0;
+            }
         }
     }
 
     fn split_selection(&mut self, _layout: LayoutId, _kind: LayoutKind) {}
 
+    fn toggle_tile_orientation(&mut self, layout: LayoutId) {
+        let Some(state) = self.layout_state(layout) else { return };
+        state.direction = state.direction.toggle();
+        if let Some(idx) = state.selected_index() {
+            state.scroll_offset = idx as f64;
+        } else {
+            state.scroll_offset = state.scroll_offset.clamp(0.0, state.max_offset());
+        }
+    }
+
     fn toggle_fullscreen_of_selection(&mut self, _layout: LayoutId) -> Vec<WindowId> { Vec::new() }
+
+    fn toggle_fullscreen_within_gaps_of_selection(&mut self, _layout: LayoutId) -> Vec<WindowId> {
+        Vec::new()
+    }
 
     fn join_selection_with_direction(&mut self, _layout: LayoutId, _direction: Direction) {}
 
-    fn apply_stacking_to_parent_of_selection(&mut self, _layout: LayoutId) -> Vec<WindowId> {
-        Vec::new()
+    fn apply_stacking_to_parent_of_selection(
+        &mut self,
+        _layout: LayoutId,
+        _default_orientation: crate::common::config::StackDefaultOrientation,
+    ) -> Vec<WindowId> {
+        vec![]
     }
 
     fn unstack_parent_of_selection(&mut self, _layout: LayoutId) -> Vec<WindowId> { Vec::new() }
@@ -572,22 +767,35 @@ impl LayoutSystem for ScrollLayoutSystem {
         if amount.abs() < f64::EPSILON {
             return;
         }
+        let default_ratio = self.settings.default_window_ratio;
         let Some(state) = self.layout_state(layout) else { return };
         if state.windows.is_empty() {
             return;
         }
 
-        state.ensure_selection();
+        state.ensure_selection(default_ratio);
         let Some(idx) = state.selected_index() else { return };
 
         state.widths[idx] = (state.widths[idx] + amount).max(MIN_WIDTH_UNITS);
-        state.ensure_widths();
+        state.ensure_widths(default_ratio);
         state.scroll_offset = state.scroll_offset.clamp(0.0, state.max_offset());
     }
 
     fn rebalance(&mut self, layout: LayoutId) {
+        let default_ratio = self.settings.default_window_ratio;
         if let Some(state) = self.layout_state(layout) {
-            state.ensure_selection();
+            if !state.windows.is_empty() {
+                state.widths.resize(state.windows.len(), default_ratio);
+                for width in &mut state.widths {
+                    *width = default_ratio;
+                }
+                state.ensure_selection(default_ratio);
+                if let Some(idx) = state.selected_index() {
+                    state.scroll_offset = idx as f64;
+                } else {
+                    state.scroll_offset = 0.0;
+                }
+            }
         }
     }
 }

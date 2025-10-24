@@ -381,16 +381,16 @@ impl EventTap {
 
         let dominant_horizontal = horizontal.abs() >= vertical.abs();
 
-        if delta_units.abs() < MIN_SCROLL_DELTA && !finalize {
-            return;
-        }
-        if !dominant_horizontal && !finalize {
+        if !delta_units.is_finite()
+            || (!finalize
+                && (delta_units.abs() < MIN_SCROLL_DELTA
+                    || (!dominant_horizontal && vertical.abs() > MIN_SCROLL_DELTA)))
+        {
             return;
         }
 
-        let cmd = LC::ScrollWorkspace { delta: delta_units, finalize };
-        wm_sender.send(WmEvent::Command(WmCommand::ReactorCommand(
-            reactor::Command::Layout(cmd),
+        _ = wm_sender.send(WmEvent::Command(WmCommand::ReactorCommand(
+            reactor::Command::Layout(LC::ScrollWorkspace { delta: delta_units, finalize }),
         )));
     }
 

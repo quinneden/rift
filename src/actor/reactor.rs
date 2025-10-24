@@ -507,7 +507,11 @@ impl Reactor {
 
     fn log_event(&self, event: &Event) {
         match event {
-            Event::WindowFrameChanged(..) | Event::MouseUp => trace!(?event, "Event"),
+            Event::WindowFrameChanged(..)
+            | Event::MouseUp
+            | Event::Command(Command::Layout(LayoutCommand::ScrollWorkspace { .. })) => {
+                trace!(?event, "Event")
+            }
             _ => debug!(?event, "Event"),
         }
     }
@@ -1192,11 +1196,11 @@ impl Reactor {
                 }
             }
             Event::MouseMovedOverWindow(wsid) => {
-                if !matches!(self.config.settings.layout.mode, LayoutMode::Scroll) {
-                    let Some(&wid) = self.window_ids.get(&wsid) else { return };
-                    if self.should_raise_on_mouse_over(wid) {
-                        self.raise_window(wid, Quiet::No, None);
-                    }
+                let Some(&wid) = self.window_ids.get(&wsid) else { return };
+                if matches!(self.config.settings.layout.mode, LayoutMode::Scroll) {
+                    self.handle_mouse_over_in_scroll(wid);
+                } else if self.should_raise_on_mouse_over(wid) {
+                    self.raise_window(wid, Quiet::No, None);
                 }
             }
             Event::SystemWoke => {
@@ -1222,7 +1226,10 @@ impl Reactor {
                 _ = self.raise_manager_tx.send(msg);
             }
             Event::Command(Command::Layout(cmd)) => {
-                info!(?cmd);
+                match &cmd {
+                    layout::LayoutCommand::ScrollWorkspace { .. } => trace!(?cmd),
+                    _ => info!(?cmd),
+                };
                 let visible_spaces =
                     self.screens.iter().flat_map(|screen| screen.space).collect::<Vec<_>>();
 
@@ -2119,6 +2126,31 @@ impl Reactor {
         true
     }
 
+    fn handle_mouse_over_in_scroll(&mut self, wid: WindowId) {
+        if !self.should_raise_on_mouse_over(wid) {
+            return;
+        }
+
+        if self.layout_engine.is_window_floating(wid) {
+            self.raise_window(wid, Quiet::No, None);
+            return;
+        }
+
+        let frame = match self.windows.get(&wid) {
+            Some(window) => window.frame_monotonic,
+            None => return,
+        };
+        let Some(space) = self.best_space_for_window(&frame) else {
+            return;
+        };
+        if !self.layout_engine.is_window_in_active_workspace(space, wid) {
+            return;
+        }
+
+        self.send_layout_event(LayoutEvent::WindowFocused(space, wid));
+        self.raise_window(wid, Quiet::No, None);
+    }
+
     fn process_windows_for_app_rules(
         &mut self,
         pid: pid_t,
@@ -2657,9 +2689,7 @@ impl Reactor {
     }
 
     fn update_focus_follows_mouse_state(&self) {
-        let is_scroll_layout = matches!(self.config.settings.layout.mode, LayoutMode::Scroll);
-        let should_enable =
-            self.menu_open_depth == 0 && !self.mission_control_active && !is_scroll_layout;
+        let should_enable = self.menu_open_depth == 0 && !self.mission_control_active;
         self.set_focus_follows_mouse_enabled(should_enable);
     }
 
